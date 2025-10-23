@@ -1,98 +1,23 @@
-import cv2
-import numpy as np
-from ultralytics import YOLO
-from PIL import Image
-import io
-import logging
-
-logger = logging.getLogger(__name__)
-
-class ProductDetector:
-    def __init__(self, model_path='yolo11n.pt', device='cpu'):
-        """Inicializa o detector YOLO11 otimizado para ARM64"""
-        self.model = YOLO(model_path)
-        self.device = device
-        self.optimized_model = None
-        
-        # Tentar exportar para NCNN (melhor para ARM64)
-        try:
-            logger.info("Exportando modelo para NCNN (otimizado para ARM64)...")
-            self.model.export(format='ncnn', imgsz=640)
-            ncnn_path = model_path.replace('.pt', '_ncnn_model')
-            self.optimized_model = YOLO(ncnn_path)
-            logger.info("Modelo NCNN carregado com sucesso!")
-        except Exception as e:
-            logger.warning(f"NCNN export falhou: {e}")
-            
-            # Fallback para ONNX Runtime
-            try:
-                logger.info("Tentando ONNX Runtime...")
-                self.model.export(format='onnx', simplify=True, imgsz=640)
-                onnx_path = model_path.replace('.pt', '.onnx')
-                self.optimized_model = YOLO(onnx_path, task='detect')
-                logger.info("Modelo ONNX carregado com sucesso!")
-            except Exception as e2:
-                logger.warning(f"ONNX export falhou: {e2}")
-                logger.info("Usando modelo PyTorch padrão (mais lento)")
-                self.optimized_model = self.model
-        
-        # Usar modelo otimizado se disponível
-        if self.optimized_model:
-            self.model = self.optimized_model
+def detect_and_crop(self, image_bytes, conf_threshold=0.3, 
+                   margin_percent=0.1, return_base64=True,
+                   max_size=1920, jpeg_quality=85):
+    """
+    Detecta produtos e retorna o crop do produto principal.
+    Se não detectar, retorna a imagem original comprimida.
     
-    def select_main_product(self, results, img_shape, 
-                           area_weight=0.5, 
-                           center_weight=0.3, 
-                           conf_weight=0.2):
-        """
-        Seleciona o produto principal baseado em área, centralização e confiança
-        """
-        img_h, img_w = img_shape[:2]
-        img_center = np.array([img_w / 2, img_h / 2])
-        img_area = img_h * img_w
-        
-        best_box = None
-        best_score = 0
-        
-        for result in results:
-            if result.boxes is None or len(result.boxes) == 0:
-                continue
-                
-            for box in result.boxes:
-                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                
-                # 1. Score de área (normalizado)
-                box_area = (x2 - x1) * (y2 - y1)
-                area_score = box_area / img_area
-                
-                # 2. Score de centralização (invertido e normalizado)
-                box_center = np.array([(x1 + x2) / 2, (y1 + y2) / 2])
-                distance = np.linalg.norm(img_center - box_center)
-                max_distance = np.linalg.norm(img_center)
-                center_score = 1 - (distance / max_distance)
-                
-                # 3. Score de confiança
-                conf_score = float(box.conf[0].cpu().numpy())
-                
-                # Score combinado
-                total_score = (area_score * area_weight + 
-                              center_score * center_weight + 
-                              conf_score * conf_weight)
-                
-                if total_score > best_score:
-                    best_score = total_score
-                    best_box = box
-        
-        return best_box, best_score
-    
-    def detect_and_crop(self, image_bytes, conf_threshold=0.3, 
-                       margin_percent=0.1, return_base64=True):
-        """
-        Detecta produtos e retorna o crop do produto principal
-        """
+    Args:
+        image_bytes: Bytes da imagem
+        conf_threshold: Threshold de confiança (0-1)
+        margin_percent: Margem adicional no crop (0-1)
+        return_base64: Retornar imagem em base64
+        max_size: Tamanho máximo da imagem (largura/altura)
+        jpeg_quality: Qualidade JPEG (70-95)
+    """
+    try:
         # Converter bytes para imagem
         image = Image.open(io.BytesIO(image_bytes))
         img = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+        original_h, original_w = img.shape[:2]
         
         # Rodar inferência (otimizada para ARM64)
         results = self.model.predict(
@@ -100,19 +25,82 @@ class ProductDetector:
             conf=conf_threshold, 
             device=self.device,
             verbose=False,
-            imgsz=640  # Tamanho fixo para melhor performance
+            imgsz=640
         )
+        
+        # Verificar se há detecções
+        total_detections = 0
+        if results and len(results) > 0 and results[0].boxes is not None:
+            total_detections = len(results[0].boxes)
+        
+        # Se não detectou nada, retornar imagem original comprimida
+        if total_detections == 0:
+            logger.warning("Nenhum produto detectado - retornando imagem original comprimida")
+            
+            # Comprimir e redimensionar imagem original
+            compressed_bytes, final_w, final_h = self.resize_and_compress(
+                img,
+                max_width=max_size,
+                max_height=max_size,
+                quality=jpeg_quality,
+                maintain_aspect=True
+            )
+            
+            response = {
+                "success": False,
+                "message": "Produto não encontrado na imagem",
+                "detections": 0,
+                "image_processed": True,
+                "original_size": {"width": original_w, "height": original_h},
+                "final_size": {"width": final_w, "height": final_h},
+                "file_size_kb": round(len(compressed_bytes) / 1024, 2),
+                "compression_quality": jpeg_quality
+            }
+            
+            if return_base64:
+                import base64
+                response["image"] = base64.b64encode(compressed_bytes).decode('utf-8')
+            else:
+                response["image_bytes"] = compressed_bytes
+            
+            return response
         
         # Selecionar produto principal
         best_box, score = self.select_main_product(results, img.shape)
         
+        # Se não encontrou um produto válido após seleção
         if best_box is None:
-            return {
+            logger.warning("Produto detectado mas não passou nos critérios - retornando imagem original")
+            
+            # Comprimir e redimensionar imagem original
+            compressed_bytes, final_w, final_h = self.resize_and_compress(
+                img,
+                max_width=max_size,
+                max_height=max_size,
+                quality=jpeg_quality,
+                maintain_aspect=True
+            )
+            
+            response = {
                 "success": False,
-                "message": "Nenhum produto detectado",
-                "detections": 0
+                "message": "Produto não encontrado na imagem",
+                "detections": total_detections,
+                "image_processed": True,
+                "original_size": {"width": original_w, "height": original_h},
+                "final_size": {"width": final_w, "height": final_h},
+                "file_size_kb": round(len(compressed_bytes) / 1024, 2),
+                "compression_quality": jpeg_quality
             }
+            
+            if return_base64:
+                import base64
+                response["image"] = base64.b64encode(compressed_bytes).decode('utf-8')
+            else:
+                response["image_bytes"] = compressed_bytes
+            
+            return response
         
+        # PRODUTO ENCONTRADO - Processar crop
         # Extrair coordenadas
         x1, y1, x2, y2 = map(int, best_box.xyxy[0].cpu().numpy())
         confidence = float(best_box.conf[0].cpu().numpy())
@@ -132,34 +120,54 @@ class ProductDetector:
         # Crop da imagem
         cropped = img[y1:y2, x1:x2]
         
-        # Converter para bytes
-        _, buffer = cv2.imencode('.jpg', cropped)
-        cropped_bytes = buffer.tobytes()
+        # Redimensionar e comprimir
+        cropped_bytes, final_w, final_h = self.resize_and_compress(
+            cropped,
+            max_width=max_size,
+            max_height=max_size,
+            quality=jpeg_quality,
+            maintain_aspect=True
+        )
         
-        # Resposta
+        # Resposta com produto encontrado
         response = {
             "success": True,
-            "detections": len(results[0].boxes) if results[0].boxes else 0,
+            "message": "Produto encontrado e processado com sucesso",
+            "detections": total_detections,
+            "image_processed": True,
             "main_product": {
                 "class": class_name,
-                "confidence": confidence,
-                "selection_score": score,
+                "confidence": round(confidence, 4),
+                "selection_score": round(score, 4),
                 "bbox": {
                     "x1": x1, "y1": y1,
                     "x2": x2, "y2": y2
                 },
-                "original_size": {"width": w, "height": h},
                 "cropped_size": {
                     "width": x2 - x1, 
                     "height": y2 - y1
                 }
-            }
+            },
+            "original_size": {"width": w, "height": h},
+            "final_size": {"width": final_w, "height": final_h},
+            "file_size_kb": round(len(cropped_bytes) / 1024, 2),
+            "compression_quality": jpeg_quality
         }
         
         if return_base64:
             import base64
-            response["cropped_image"] = base64.b64encode(cropped_bytes).decode('utf-8')
+            response["image"] = base64.b64encode(cropped_bytes).decode('utf-8')
         else:
-            response["cropped_bytes"] = cropped_bytes
+            response["image_bytes"] = cropped_bytes
         
         return response
+        
+    except Exception as e:
+        logger.error(f"Erro ao processar imagem: {str(e)}", exc_info=True)
+        return {
+            "success": False,
+            "message": f"Erro ao processar imagem: {str(e)}",
+            "detections": 0,
+            "image_processed": False,
+            "error_type": type(e).__name__
+        }
