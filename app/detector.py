@@ -3,20 +3,42 @@ import numpy as np
 from ultralytics import YOLO
 from PIL import Image
 import io
+import logging
+
+logger = logging.getLogger(__name__)
 
 class ProductDetector:
     def __init__(self, model_path='yolo11n.pt', device='cpu'):
-        """Inicializa o detector YOLO11 otimizado para CPU"""
+        """Inicializa o detector YOLO11 otimizado para ARM64"""
         self.model = YOLO(model_path)
         self.device = device
+        self.optimized_model = None
         
-        # Exportar para OpenVINO na primeira vez
+        # Tentar exportar para NCNN (melhor para ARM64)
         try:
-            self.model.export(format='openvino', int8=True)
-            # Recarregar modelo OpenVINO
-            self.model = YOLO(model_path.replace('.pt', '_openvino_model'))
-        except:
-            pass  # Se já foi exportado, continua
+            logger.info("Exportando modelo para NCNN (otimizado para ARM64)...")
+            self.model.export(format='ncnn', imgsz=640)
+            ncnn_path = model_path.replace('.pt', '_ncnn_model')
+            self.optimized_model = YOLO(ncnn_path)
+            logger.info("Modelo NCNN carregado com sucesso!")
+        except Exception as e:
+            logger.warning(f"NCNN export falhou: {e}")
+            
+            # Fallback para ONNX Runtime
+            try:
+                logger.info("Tentando ONNX Runtime...")
+                self.model.export(format='onnx', simplify=True, imgsz=640)
+                onnx_path = model_path.replace('.pt', '.onnx')
+                self.optimized_model = YOLO(onnx_path, task='detect')
+                logger.info("Modelo ONNX carregado com sucesso!")
+            except Exception as e2:
+                logger.warning(f"ONNX export falhou: {e2}")
+                logger.info("Usando modelo PyTorch padrão (mais lento)")
+                self.optimized_model = self.model
+        
+        # Usar modelo otimizado se disponível
+        if self.optimized_model:
+            self.model = self.optimized_model
     
     def select_main_product(self, results, img_shape, 
                            area_weight=0.5, 
@@ -31,7 +53,6 @@ class ProductDetector:
         
         best_box = None
         best_score = 0
-        best_result = None
         
         for result in results:
             if result.boxes is None or len(result.boxes) == 0:
@@ -61,9 +82,8 @@ class ProductDetector:
                 if total_score > best_score:
                     best_score = total_score
                     best_box = box
-                    best_result = result
         
-        return best_box, best_result, best_score
+        return best_box, best_score
     
     def detect_and_crop(self, image_bytes, conf_threshold=0.3, 
                        margin_percent=0.1, return_base64=True):
@@ -74,19 +94,17 @@ class ProductDetector:
         image = Image.open(io.BytesIO(image_bytes))
         img = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
         
-        # Rodar inferência
+        # Rodar inferência (otimizada para ARM64)
         results = self.model.predict(
             img, 
             conf=conf_threshold, 
             device=self.device,
-            verbose=False
+            verbose=False,
+            imgsz=640  # Tamanho fixo para melhor performance
         )
         
         # Selecionar produto principal
-        best_box, best_result, score = self.select_main_product(
-            results, 
-            img.shape
-        )
+        best_box, score = self.select_main_product(results, img.shape)
         
         if best_box is None:
             return {
